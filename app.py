@@ -1,5 +1,5 @@
 import streamlit as st
-import anthropic
+import google.generativeai as genai
 import pypdf
 from rank_bm25 import BM25Okapi
 from io import BytesIO
@@ -7,14 +7,15 @@ import os
 
 st.set_page_config(page_title="Financial RAG Assistant", page_icon="📊", layout="wide")
 
-# Initialize Anthropic client
+# Initialize Gemini
 @st.cache_resource
-def get_anthropic_client():
-    api_key = os.getenv("ANTHROPIC_API_KEY") or st.secrets.get("ANTHROPIC_API_KEY", "")
+def get_gemini_model():
+    api_key = os.getenv("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", "")
     if not api_key:
-        st.error("Please set ANTHROPIC_API_KEY in secrets!")
+        st.error("Please set GEMINI_API_KEY in secrets!")
         st.stop()
-    return anthropic.Anthropic(api_key=api_key)
+    genai.configure(api_key=api_key)
+    return genai.GenerativeModel('gemini-1.5-flash')
 
 class Document:
     def __init__(self, content, metadata):
@@ -22,27 +23,26 @@ class Document:
         self.metadata = metadata
 
 def extract_pdf_text(pdf_file):
-    """Extract text from PDF with smaller chunks"""
+    """Extract text from PDF"""
     pdf_reader = pypdf.PdfReader(BytesIO(pdf_file.read()))
     documents = []
     
     for page_num, page in enumerate(pdf_reader.pages, 1):
         text = page.extract_text()
         if text.strip():
-            # Smaller chunks - 3 sentences instead of 5
             sentences = text.split('. ')
             for i in range(0, len(sentences), 3):
                 chunk = '. '.join(sentences[i:i+3])
-                if chunk.strip() and len(chunk) > 50:  # Skip tiny chunks
+                if chunk.strip() and len(chunk) > 50:
                     documents.append(Document(
-                        content=chunk[:500],  # Limit chunk size to 500 chars
+                        content=chunk[:500],
                         metadata={"filename": pdf_file.name, "page": page_num}
                     ))
     
     return documents, len(pdf_reader.pages)
 
 def search_documents(query, documents, k=3):
-    """Search documents using BM25 - only top 3 results"""
+    """Search documents using BM25"""
     corpus = [doc.page_content.lower().split() for doc in documents]
     bm25 = BM25Okapi(corpus)
     tokenized_query = query.lower().split()
@@ -51,13 +51,13 @@ def search_documents(query, documents, k=3):
     return [documents[i] for i in top_indices]
 
 def answer_question(query, documents):
-    """Answer question using RAG with limited context"""
-    client = get_anthropic_client()
+    """Answer question using RAG with Gemini"""
+    model = get_gemini_model()
     
-    # Get only top 3 most relevant documents
+    # Get top 3 relevant documents
     relevant_docs = search_documents(query, documents, k=3)
     
-    # Build concise context
+    # Build context
     context_parts = []
     for doc in relevant_docs:
         context_parts.append(
@@ -66,30 +66,29 @@ def answer_question(query, documents):
     
     context = "\n\n".join(context_parts)
     
-    # Limit total context to 3000 characters
     if len(context) > 3000:
         context = context[:3000] + "..."
     
     try:
-        # Query Claude with limited context
-        message = client.messages.create(
-            model="claude-3-5-sonnet-20241022",
-            max_tokens=1024,
-            messages=[{
-                "role": "user",
-                "content": f"Answer based on this context. Cite sources.\n\nContext:\n{context}\n\nQuestion: {query}\n\nAnswer:"
-            }]
-        )
+        prompt = f"""Answer based on this context. Always cite the source document and page number.
+
+Context:
+{context}
+
+Question: {query}
+
+Answer:"""
         
-        return message.content[0].text, relevant_docs
+        response = model.generate_content(prompt)
+        return response.text, relevant_docs
     
     except Exception as e:
         st.error(f"Error: {str(e)}")
-        return f"Error querying Claude: {str(e)}", []
+        return f"Error: {str(e)}", []
 
 # UI
 st.title("📊 Financial Research Assistant")
-st.markdown("Upload financial documents and ask questions")
+st.markdown("Upload financial documents and ask questions • Powered by Google Gemini (FREE)")
 
 # Initialize session state
 if "documents" not in st.session_state:
@@ -97,14 +96,14 @@ if "documents" not in st.session_state:
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
-# Sidebar for file upload
+# Sidebar
 with st.sidebar:
     st.header("📁 Upload Documents")
     uploaded_files = st.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True)
     
     if uploaded_files:
         if st.button("Process Documents"):
-            with st.spinner("Processing documents..."):
+            with st.spinner("Processing..."):
                 st.session_state.documents = []
                 for pdf_file in uploaded_files:
                     docs, pages = extract_pdf_text(pdf_file)
@@ -119,9 +118,8 @@ with st.sidebar:
         st.session_state.chat_history = []
         st.rerun()
 
-# Main chat interface
+# Chat interface
 if st.session_state.documents:
-    # Display chat history
     for message in st.session_state.chat_history:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
@@ -132,14 +130,11 @@ if st.session_state.documents:
                         st.text(doc.page_content[:200] + "...")
                         st.divider()
     
-    # Chat input
     if prompt := st.chat_input("Ask a question..."):
-        # Add user message
         st.session_state.chat_history.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
         
-        # Get answer
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
                 answer, sources = answer_question(prompt, st.session_state.documents)
@@ -152,7 +147,6 @@ if st.session_state.documents:
                             st.text(doc.page_content[:200] + "...")
                             st.divider()
         
-        # Add assistant message
         st.session_state.chat_history.append({
             "role": "assistant", 
             "content": answer,
@@ -161,7 +155,6 @@ if st.session_state.documents:
 
 else:
     st.info("👈 Upload PDF documents to get started!")
-    
     st.markdown("### Example Questions:")
     st.markdown("- What is the total revenue?")
     st.markdown("- Summarize the main risks")
