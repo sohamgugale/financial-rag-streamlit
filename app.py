@@ -11,7 +11,10 @@ st.set_page_config(page_title="Financial RAG Assistant", page_icon="📊", layou
 @st.cache_resource
 def get_anthropic_client():
     api_key = os.getenv("ANTHROPIC_API_KEY") or st.secrets.get("ANTHROPIC_API_KEY", "")
-    return anthropic.Client(api_key=api_key)
+    if not api_key:
+        st.error("Please set ANTHROPIC_API_KEY in secrets!")
+        st.stop()
+    return anthropic.Anthropic(api_key=api_key)
 
 class Document:
     def __init__(self, content, metadata):
@@ -19,26 +22,27 @@ class Document:
         self.metadata = metadata
 
 def extract_pdf_text(pdf_file):
-    """Extract text from PDF"""
+    """Extract text from PDF with smaller chunks"""
     pdf_reader = pypdf.PdfReader(BytesIO(pdf_file.read()))
     documents = []
     
     for page_num, page in enumerate(pdf_reader.pages, 1):
         text = page.extract_text()
         if text.strip():
+            # Smaller chunks - 3 sentences instead of 5
             sentences = text.split('. ')
-            for i in range(0, len(sentences), 5):
-                chunk = '. '.join(sentences[i:i+5])
-                if chunk.strip():
+            for i in range(0, len(sentences), 3):
+                chunk = '. '.join(sentences[i:i+3])
+                if chunk.strip() and len(chunk) > 50:  # Skip tiny chunks
                     documents.append(Document(
-                        content=chunk,
+                        content=chunk[:500],  # Limit chunk size to 500 chars
                         metadata={"filename": pdf_file.name, "page": page_num}
                     ))
     
     return documents, len(pdf_reader.pages)
 
-def search_documents(query, documents, k=5):
-    """Search documents using BM25"""
+def search_documents(query, documents, k=3):
+    """Search documents using BM25 - only top 3 results"""
     corpus = [doc.page_content.lower().split() for doc in documents]
     bm25 = BM25Okapi(corpus)
     tokenized_query = query.lower().split()
@@ -47,29 +51,41 @@ def search_documents(query, documents, k=5):
     return [documents[i] for i in top_indices]
 
 def answer_question(query, documents):
-    """Answer question using RAG"""
+    """Answer question using RAG with limited context"""
     client = get_anthropic_client()
     
-    # Get relevant documents
-    relevant_docs = search_documents(query, documents)
+    # Get only top 3 most relevant documents
+    relevant_docs = search_documents(query, documents, k=3)
     
-    # Build context
-    context = "\n\n".join([
-        f"Source: {doc.metadata['filename']} (Page {doc.metadata['page']})\n{doc.page_content}"
-        for doc in relevant_docs
-    ])
+    # Build concise context
+    context_parts = []
+    for doc in relevant_docs:
+        context_parts.append(
+            f"[{doc.metadata['filename']}, p.{doc.metadata['page']}]: {doc.page_content[:300]}"
+        )
     
-    # Query Claude
-    message = client.messages.create(
-        model="claude-3-5-sonnet-20241022",
-        max_tokens=1500,
-        messages=[{
-            "role": "user",
-            "content": f"Based on the following context, answer the question. Always cite the source document and page.\n\nContext:\n{context}\n\nQuestion: {query}\n\nAnswer:"
-        }]
-    )
+    context = "\n\n".join(context_parts)
     
-    return message.content[0].text, relevant_docs
+    # Limit total context to 3000 characters
+    if len(context) > 3000:
+        context = context[:3000] + "..."
+    
+    try:
+        # Query Claude with limited context
+        message = client.messages.create(
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=1024,
+            messages=[{
+                "role": "user",
+                "content": f"Answer based on this context. Cite sources.\n\nContext:\n{context}\n\nQuestion: {query}\n\nAnswer:"
+            }]
+        )
+        
+        return message.content[0].text, relevant_docs
+    
+    except Exception as e:
+        st.error(f"Error: {str(e)}")
+        return f"Error querying Claude: {str(e)}", []
 
 # UI
 st.title("📊 Financial Research Assistant")
@@ -96,7 +112,12 @@ with st.sidebar:
                     st.success(f"✅ {pdf_file.name} ({pages} pages, {len(docs)} chunks)")
     
     st.divider()
-    st.markdown(f"**Total Documents:** {len(st.session_state.documents)} chunks")
+    st.markdown(f"**Total:** {len(st.session_state.documents)} chunks")
+    
+    if st.button("Clear All"):
+        st.session_state.documents = []
+        st.session_state.chat_history = []
+        st.rerun()
 
 # Main chat interface
 if st.session_state.documents:
@@ -105,14 +126,14 @@ if st.session_state.documents:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
             if "sources" in message:
-                with st.expander("📄 View Sources"):
+                with st.expander("📄 Sources"):
                     for doc in message["sources"]:
                         st.markdown(f"**{doc.metadata['filename']}** - Page {doc.metadata['page']}")
                         st.text(doc.page_content[:200] + "...")
                         st.divider()
     
     # Chat input
-    if prompt := st.chat_input("Ask a question about your documents..."):
+    if prompt := st.chat_input("Ask a question..."):
         # Add user message
         st.session_state.chat_history.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
@@ -124,11 +145,12 @@ if st.session_state.documents:
                 answer, sources = answer_question(prompt, st.session_state.documents)
                 st.markdown(answer)
                 
-                with st.expander("📄 View Sources"):
-                    for doc in sources:
-                        st.markdown(f"**{doc.metadata['filename']}** - Page {doc.metadata['page']}")
-                        st.text(doc.page_content[:200] + "...")
-                        st.divider()
+                if sources:
+                    with st.expander("📄 Sources"):
+                        for doc in sources:
+                            st.markdown(f"**{doc.metadata['filename']}** - Page {doc.metadata['page']}")
+                            st.text(doc.page_content[:200] + "...")
+                            st.divider()
         
         # Add assistant message
         st.session_state.chat_history.append({
@@ -140,8 +162,7 @@ if st.session_state.documents:
 else:
     st.info("👈 Upload PDF documents to get started!")
     
-    # Example
     st.markdown("### Example Questions:")
-    st.markdown("- What are the key financial metrics?")
+    st.markdown("- What is the total revenue?")
     st.markdown("- Summarize the main risks")
-    st.markdown("- What revenue growth is reported?")
+    st.markdown("- What are the business segments?")
