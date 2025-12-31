@@ -15,7 +15,7 @@ def get_gemini_model():
         st.error("Please set GEMINI_API_KEY in secrets!")
         st.stop()
     genai.configure(api_key=api_key)
-    return genai.GenerativeModel('gemini-1.5-flash')
+    return genai.GenerativeModel('gemini-pro')  # Changed from gemini-1.5-flash
 
 class Document:
     def __init__(self, content, metadata):
